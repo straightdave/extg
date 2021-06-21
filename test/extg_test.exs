@@ -12,8 +12,34 @@ defmodule ExtgTest do
   end
 
   test "can close without error" do
-    tg = Extg.new()
+    tg =
+      Extg.new()
+      |> Extg.add(fn ->
+        :timer.sleep(2_000)
+        :ok
+      end)
+      |> Extg.add(fn ->
+        :timer.sleep(1_000)
+        :ok
+      end)
+
     Extg.close(tg)
+
+    assert {:error, :by_caller} == Extg.wait(tg)
+  end
+
+  test "exit if waiting exceeds timeout" do
+    res =
+      Extg.new()
+      |> Extg.add(fn -> :ok end)
+      |> Extg.add(fn ->
+        :timer.sleep(2_000)
+        :ok
+      end)
+      |> Extg.add(fn -> :ok end)
+      |> Extg.wait(1_000)
+
+    assert res == {:error, :timeout}
   end
 
   test "all tasks complete normally" do

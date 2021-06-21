@@ -1,6 +1,39 @@
 defmodule Extg do
   @moduledoc """
-  Documentation for `Extg`.
+  Task Group that expects all tasks to succeed or fail fast due to one fails.
+
+  ## Example
+
+  Normal case:
+
+      res =
+        Extg.new()
+        |> Extg.add(fn -> :ok end)
+        |> Extg.add(fn -> :ok end)
+        |> Extg.wait()
+
+      res # => [:ok, :ok]
+
+  If one of tasks fails:
+
+      res =
+        Extg.new()
+        |> Extg.add(fn ->
+          :timer.sleep(5_000)
+          :ok
+        end)
+        |> Extg.add(fn ->
+          :timer.sleep(1_000)
+          raise "something wrong"
+          :ok
+        end)
+        |> Extg.wait()
+
+      res # => {:error, %RuntimeError{message: "something wrong"}}
+
+  In this case, `wait()` will stop as soon as error raised in the 2nd task. The first task was sent a `:exit`.
+
+  For more details please see the test cases or document for each functions.
   """
 
   use GenServer
@@ -9,22 +42,41 @@ defmodule Extg do
 
   @wait_interval 100
 
+  @doc """
+  Create a new task group process, returning a pid of it if succeeds.
+  """
+  @spec new() :: pid()
   def new do
-    {:ok, wg} = GenServer.start(__MODULE__, [])
-    wg
+    {:ok, tg} = GenServer.start(__MODULE__, [])
+    tg
   end
 
-  def add(wg, fun) when is_pid(wg) do
-    GenServer.cast(wg, {:add, fun})
-    wg
+  @doc """
+  Add a task (in the form of an anonymous function) to the task group.
+  Returning pid of task group.
+  """
+  @spec add(pid(), function()) :: pid()
+  def add(tg, fun) when is_pid(tg) do
+    GenServer.cast(tg, {:add, fun})
+    tg
   end
 
-  def wait(wg) when is_pid(wg) do
-    GenServer.call(wg, :wait, :infinity)
+  @doc """
+  Wait for all tasks in task group to complete. It blocks.
+  If `timeout` is `:infinity` (default), this would block ad infinite.
+  """
+  @spec wait(pid(), timeout :: atom() | integer()) :: [any] | {:error, term()}
+  def wait(tg, timeout \\ :infinity)
+      when is_pid(tg) and (timeout == :infinity or is_integer(timeout)) do
+    GenServer.call(tg, {:wait, timeout}, :infinity)
   end
 
-  def close(wg) when is_pid(wg) do
-    Process.exit(wg, :by_caller)
+  @doc """
+  Manually exit the task group process, letting all tasks exit too.
+  """
+  @spec close(pid()) :: true
+  def close(tg) when is_pid(tg) do
+    Process.exit(tg, :by_caller)
   end
 
   @impl GenServer
@@ -74,33 +126,20 @@ defmodule Extg do
   end
 
   @impl GenServer
-  def handle_call(:wait, _from, state) do
-    do_wait(state, [])
+  def handle_call({:wait, timeout}, _from, state) do
+    if timeout == :infinity do
+      do_wait(state, [])
+    else
+      do_wait_with_timeout(state, [], timeout)
+    end
   end
 
-  defp do_wait(%{exit: reason} = state, acc) when is_nil(reason) do
-    yield_results =
-      state.tasks
-      |> Enum.map(fn task ->
-        case Task.yield(task, @wait_interval) do
-          {:ok, res} ->
-            {:ok, res}
+  defp do_wait(%{exit: reason} = state, _acc) when not is_nil(reason) do
+    {:reply, {:error, reason}, state}
+  end
 
-          {:exit, r} ->
-            throw(r)
-
-          nil ->
-            nil
-        end
-      end)
-
-    res =
-      yield_results
-      |> Enum.filter(fn
-        {:ok, _res} -> true
-        _ -> false
-      end)
-      |> Enum.map(fn {:ok, res} -> res end)
+  defp do_wait(state, acc) do
+    res = yield_tasks!(state.tasks)
 
     if length(acc) + length(res) < length(state.tasks) do
       do_wait(state, acc ++ res)
@@ -112,7 +151,54 @@ defmodule Extg do
       {:reply, {:error, r}, state}
   end
 
-  defp do_wait(%{exit: reason} = state, _) do
+  defp do_wait_with_timeout(%{exit: reason} = state, _acc, _time)
+       when not is_nil(reason) do
     {:reply, {:error, reason}, state}
+  end
+
+  defp do_wait_with_timeout(state, _acc, time)
+       when time < 0 do
+    for t <- state.tasks do
+      Process.exit(t.pid, :by_caller)
+    end
+
+    {:reply, {:error, :timeout}, state}
+  end
+
+  defp do_wait_with_timeout(state, acc, time) do
+    {elapsed, res} =
+      :timer.tc(fn ->
+        yield_tasks!(state.tasks)
+      end)
+
+    if length(acc) + length(res) < length(state.tasks) do
+      do_wait_with_timeout(state, acc ++ res, time - elapsed / 1_000)
+    else
+      {:reply, acc ++ res, state}
+    end
+  catch
+    :throw, r ->
+      {:reply, {:error, r}, state}
+  end
+
+  defp yield_tasks!(tasks) do
+    tasks
+    |> Enum.map(fn task ->
+      case Task.yield(task, @wait_interval) do
+        {:ok, res} ->
+          {:ok, res}
+
+        {:exit, r} ->
+          throw(r)
+
+        nil ->
+          nil
+      end
+    end)
+    |> Enum.filter(fn
+      {:ok, _res} -> true
+      _ -> false
+    end)
+    |> Enum.map(fn {:ok, res} -> res end)
   end
 end
